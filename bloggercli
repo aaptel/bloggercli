@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+# bloggercli - cli tool to manage your blogger posts
+# Copyright (C) 2018  Aurelien Aptel <aurelien.aptel@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+from oauth2client.client import flow_from_clientsecrets
+import httplib2
+from apiclient.discovery import build
+from oauth2client.file import Storage
+import webbrowser
+import os
+import sys
+import re
+import subprocess
+import argparse
+from pprint import pprint as P
+
+
+def get_list(posts_api, **kwargs):
+    posts_req = posts_api.list(**kwargs)
+    posts_rsp = posts_req.execute()
+
+    if posts_rsp is None or 'items' not in posts_rsp:
+        return []
+
+    res = posts_rsp['items']
+
+    while True:
+        new_req = posts_api.list_next(posts_req, posts_rsp)
+        if new_req is None:
+            break
+
+        new_rsp = new_req.execute()
+        res += new_rsp['items']
+
+        posts_req, posts_rsp = new_req, new_rsp
+
+    return res
+
+def cmd_list(args):
+    served = get_service()
+    blogs_api = served.blogs()
+    b = blogs_api.get(blogId=args.bid).execute()
+    print("blog \"%s\" %s"%(b['name'], b['url']))
+    posts_api = served.posts()
+
+    posts = []
+    for status in ["draft", "scheduled", "live"]:
+        posts.extend(get_list(posts_api, blogId=args.bid, fetchBodies=False, view="ADMIN", status=status))
+
+    for p in posts:
+        print("post id:%s status:%s %s"%(p['id'], p['status'], p['title']))
+
+def cmd_getpost(args):
+    served = get_service()
+    posts_api = served.posts()
+    p = posts_api.get(blogId=args.bid, postId=args.postid, view="ADMIN").execute()
+    print("post %s\n%s"%(p['title'], p['content']))
+
+def cmd_newpost(args):
+
+    content = None
+
+    if args.file is None:
+        content = sys.stdin.read()
+    else:
+        with open(args.file) as f:
+            content = f.read()
+
+    body = {
+        'title': args.title,
+        'content': content,
+    }
+
+    served = get_service()
+    posts_api = served.posts()
+    req = posts_api.insert(blogId=args.bid, isDraft=args.draft, body=body)
+    p = req.execute()
+    print("post id:%s %s"%(p['id'], p['url']))
+
+def cmd_setpost(args):
+    kw = {
+        'blogId': args.bid,
+        'postId': args.postid,
+    }
+    extra = {}
+
+    content = None
+    if args.content:
+        with open(args.content) as f:
+            content = f.read()
+
+    if args.draft and args.publish:
+        die("cannot set both draft and publish")
+
+    if args.draft:
+        extra['revert'] = True
+
+    if args.publish:
+        extra['publish'] = True
+
+    served = get_service()
+    posts_api = served.posts()
+    p = posts_api.get(blogId=args.bid, postId=args.postid, view="ADMIN").execute()
+
+    if args.title:
+        p['title'] = args.title
+    if content:
+        p['content'] = content
+
+    extra['body'] = p
+    kw.update(extra)
+    rsp = posts_api.update(**kw).execute()
+
+def cmd_delpost(args):
+    served = get_service()
+    posts_api = served.posts()
+    p = posts_api.delete(blogId=args.bid, postId=args.postid).execute()
+
+def main():
+    ap = argparse.ArgumentParser(description="Blogger CLI client")
+    ap.add_argument("-i", "--id", dest="bid", help="blog id", default="6722837983802369306")
+    subp = ap.add_subparsers()
+
+    listp = subp.add_parser("list", help="list posts")
+    listp.set_defaults(func=cmd_list)
+
+    getpostp = subp.add_parser("getpost", help="get post")
+    getpostp.add_argument("postid", help="post id")
+    getpostp.set_defaults(func=cmd_getpost)
+
+    newpostp = subp.add_parser("newpost", help="make a new post")
+    newpostp.add_argument("-d", "--draft", action="store_true", default=False, help="post as a draft")
+    newpostp.add_argument("-t", "--title", help="post title")
+    newpostp.add_argument("file", nargs='?', help="path to post content (stdin otherwise)")
+    newpostp.set_defaults(func=cmd_newpost)
+
+    setpostp = subp.add_parser("setpost", help="modify existing post")
+    setpostp.add_argument("postid", help="post id")
+    setpostp.add_argument("-t", "--title", help="edit post title")
+    setpostp.add_argument("-c", "--content", help="path to new content file")
+    setpostp.add_argument("-d", "--draft", action="store_true", help="mark post as draft")
+    setpostp.add_argument("-p", "--publish", action="store_true", help="publish post if draft")
+    setpostp.set_defaults(func=cmd_setpost)
+
+    delpostp = subp.add_parser("delpost", help="delete a post")
+    delpostp.add_argument("postid", help="post id")
+    delpostp.set_defaults(func=cmd_delpost)
+
+    args = ap.parse_args()
+    args.func(args)
+
+def get_credentials():
+    scope = 'https://www.googleapis.com/auth/blogger'
+    flow = flow_from_clientsecrets(
+        'client_id.json', scope,
+        redirect_uri='urn:ietf:wg:oauth:2.0:oob')
+    storage = Storage('credentials.dat')
+    credentials = storage.get()
+
+    if  not credentials or credentials.invalid:
+        auth_uri = flow.step1_get_authorize_url()
+        webbrowser.open(auth_uri)
+        auth_code = input('Enter the auth code: ')
+        credentials = flow.step2_exchange(auth_code)
+        storage.put(credentials)
+    return credentials
+
+def get_service():
+    """Returns an authorised blogger api service."""
+    credentials = get_credentials()
+    http = httplib2.Http()
+    http = credentials.authorize(http)
+    service = build('blogger', 'v3', http=http)
+    return service
+
+def die(s):
+    print(s, file=sys.stderr)
+    exit(1)
+
+if __name__ == '__main__':
+    main()
